@@ -2,10 +2,6 @@
 
 A lightweight, efficient CSV viewer application that loads and displays CSV files page by page. Built with Python and Tkinter.
 
-## Demo
-
-![Demo](demo.gif)
-
 ## Features
 
 - **Page-by-page loading**: Handle large CSV files efficiently by loading only what you need

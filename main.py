@@ -1,6 +1,8 @@
 import csv
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from time import sleep
+from threading import Thread
 
 
 class LazyCSVViewerGUI:
@@ -49,6 +51,16 @@ class LazyCSVViewerGUI:
         # Setup the UI components and event bindings
         self._setup_widgets()
         self._setup_bindings()
+        self._open_file_from_thread()
+
+    def _open_file_from_thread(self):
+        # using another thread, else the GUI will not open until the sleep is over
+        def _open_file():
+            sleep(0.5)  # wait for the window to be ready
+            self.open_file()
+
+        thread = Thread(target=_open_file)
+        thread.start()
 
     def on_horizontal_mousewheel(self, event):
         """
@@ -222,6 +234,10 @@ class LazyCSVViewerGUI:
             self.frame, text="Previous Page", command=self.prev_page
         )
         self.prev_button.grid(row=3, column=0, pady=5)
+
+        # Add page number label between the buttons
+        self.page_label = ttk.Label(self.frame, text="Page 1", font=("Helvetica", 10))
+        self.page_label.grid(row=3, column=0, columnspan=2, pady=5)
 
         self.next_button = ttk.Button(
             self.frame, text="Next Page", command=self.next_page
@@ -468,6 +484,8 @@ class LazyCSVViewerGUI:
         if self.has_next_page:
             self.current_page += 1
             self._load_page()
+            # Update the page label
+            self.page_label.config(text=f"Page {self.current_page + 1}")
         else:
             messagebox.showinfo("End", "You are at the end of the file.")
 
@@ -476,6 +494,8 @@ class LazyCSVViewerGUI:
         if self.current_page > 0:
             self.current_page -= 1
             self._load_page()
+            # Update the page label
+            self.page_label.config(text=f"Page {self.current_page + 1}")
         else:
             messagebox.showinfo("Start", "You are at the start of the file.")
 
@@ -483,6 +503,11 @@ class LazyCSVViewerGUI:
 if __name__ == "__main__":
     # Create the main window and start the application
     root = tk.Tk()
-    root.geometry("800x600")  # Set initial window size
+    # Set window to full screen by default
+    root.state("zoomed")  # Works on Windows
+    # Fallback to geometry method for other platforms
+    width = root.winfo_screenwidth()
+    height = root.winfo_screenheight()
+    root.geometry(f"{width}x{height}+0+0")
     app = LazyCSVViewerGUI(root)
     root.mainloop()

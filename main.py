@@ -1,8 +1,6 @@
 import csv
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from time import sleep
-from threading import Thread
 
 
 class LazyCSVViewerGUI:
@@ -51,16 +49,6 @@ class LazyCSVViewerGUI:
         # Setup the UI components and event bindings
         self._setup_widgets()
         self._setup_bindings()
-        self._open_file_from_thread()
-
-    def _open_file_from_thread(self):
-        # using another thread, else the GUI will not open until the sleep is over
-        def _open_file():
-            sleep(0.5)  # wait for the window to be ready
-            self.open_file()
-
-        thread = Thread(target=_open_file)
-        thread.start()
 
     def on_horizontal_mousewheel(self, event):
         """

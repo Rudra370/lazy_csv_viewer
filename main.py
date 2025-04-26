@@ -9,7 +9,7 @@ class LazyCSVViewerGUI:
     Supports navigation between pages and horizontal/vertical scrolling.
     """
 
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         """
         Initialize the application with the main window and default settings.
 
@@ -101,6 +101,19 @@ class LazyCSVViewerGUI:
         # Focus tree view when clicking on it
         self.tree.bind("<Button-1>", lambda e: self.tree.focus_set())
 
+        self.tree.bind("<ButtonRelease-1>", self.select_item_and_copy)
+
+    def select_item_and_copy(self, event):
+        # check if click cell to copy is enabled
+        if not self.click_cell_to_copy_var.get():
+            return
+
+        cur_item = self.tree.item(self.tree.focus())
+
+        col = self.tree.identify_column(event.x)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cur_item["values"][int(col[1:]) - 1])
+
     def _setup_widgets(self):
         """Create and arrange all UI widgets for the application."""
         # Main frame with padding
@@ -144,13 +157,17 @@ class LazyCSVViewerGUI:
 
         # Entry widget for page size
         self.page_size_entry = ttk.Entry(
-            top_controls, textvariable=self.page_size_var, width=6
+            top_controls,
+            textvariable=self.page_size_var,
+            width=6,
         )
         self.page_size_entry.pack(side=tk.LEFT, padx=5)
 
         # Apply button for page size changes
         self.apply_page_size_button = ttk.Button(
-            top_controls, text="Apply", command=self._on_page_size_changed
+            top_controls,
+            text="Apply",
+            command=self._on_page_size_changed,
         )
         self.apply_page_size_button.pack(side=tk.LEFT)
 
@@ -171,6 +188,14 @@ class LazyCSVViewerGUI:
         )
         self.column_visibility_button.pack(side=tk.LEFT, padx=(10, 0))
 
+        # Checkbox for copying cell content on click
+        self.click_cell_to_copy_var = tk.BooleanVar(value=False)
+        self.click_cell_to_copy_checkbox = ttk.Checkbutton(
+            top_controls,
+            text="Click Cell to Copy",
+            variable=self.click_cell_to_copy_var,
+        )
+        self.click_cell_to_copy_checkbox.pack(side=tk.LEFT, padx=(10, 0))
         # Treeview for displaying CSV data
         self.tree = ttk.Treeview(self.frame, show="headings")
         self.tree.grid(row=1, column=0, columnspan=2, sticky="nsew")
@@ -188,9 +213,10 @@ class LazyCSVViewerGUI:
         self.xscrollbar.grid(row=2, column=0, columnspan=2, sticky="ew")
 
         # Connect scrollbars to treeview
-        self.tree.configure(yscrollcommand=self.scrollbar.set)
-        self.tree.configure(xscrollcommand=self.xscrollbar.set)
-
+        self.tree.configure(
+            yscrollcommand=self.scrollbar.set,
+            xscrollcommand=self.xscrollbar.set,
+        )
         # Navigation buttons
         self.prev_button = ttk.Button(
             self.frame, text="Previous Page", command=self.prev_page
@@ -434,8 +460,8 @@ class LazyCSVViewerGUI:
                 self.has_next_page = False
 
             # Configure row tags for alternating colors
-            self.tree.tag_configure("odd", background=self.odd_row_color)
-            self.tree.tag_configure("even", background=self.even_row_color)
+            self.tree.tag_configure("even", background=self.odd_row_color)
+            self.tree.tag_configure("odd", background=self.even_row_color)
 
     def next_page(self):
         """Navigate to the next page of data if available."""

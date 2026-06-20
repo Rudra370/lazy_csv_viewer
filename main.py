@@ -1,4 +1,8 @@
 import csv
+import io
+import os
+import subprocess
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -24,8 +28,15 @@ class LazyCSVViewerGUI:
         self.page_size = 200  # Changed default to 200 rows per page
         self.current_page = 0
         self.has_next_page = False
+        # Byte offset of the first data row of each visited page, so Next/Prev
+        # can seek() directly instead of re-scanning from the top (O(1) paging).
+        self.page_offsets = {}
+        self._byte_pos = 0  # Updated by _row_iter while reading
+        self.total_rows = None  # Estimated/exact total data rows (None = unknown)
+        self.total_is_estimate = False  # True when total_rows is a sample estimate
         self.scroll_speed = 20  # Controls how fast horizontal scrolling moves
-        self.delimiter = "\t"  # Default delimiter (tab)
+        self.delimiter = ","  # Default delimiter (comma)
+        self.encoding = "utf-8"  # Detected per-file when a file is opened
         self.expand_columns = False  # Track state for column expansion
         self.hidden_columns = set()  # Track hidden columns
         self.column_headers = []  # Store column headers for reference
@@ -37,18 +48,76 @@ class LazyCSVViewerGUI:
             (" ", "Space ( )"),
         ]
 
-        # Configure Treeview style for striped rows
+        # Configure Treeview style and pick a palette that matches the OS appearance
         self.style = ttk.Style()
         self.style.configure("Treeview", rowheight=25)
-        self.style.map("Treeview", background=[("selected", "#0078D7")])
-
-        # Define colors for alternating rows
-        self.odd_row_color = "#F0F0F0"  # Light gray for odd rows
-        self.even_row_color = "#FFFFFF"  # White for even rows
+        self._apply_theme()
 
         # Setup the UI components and event bindings
         self._setup_widgets()
         self._setup_bindings()
+
+        # Nav buttons start disabled until a file is loaded
+        self._update_nav_buttons()
+
+    def _detect_dark_mode(self):
+        """
+        Return True if the OS is using a dark appearance.
+
+        Only macOS is probed (via `defaults read -g AppleInterfaceStyle`,
+        which returns "Dark" in dark mode and errors out in light mode).
+        On every other platform this returns False so the original light
+        palette is kept unchanged.
+        """
+        if sys.platform != "darwin":
+            return False
+        try:
+            result = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            return result.stdout.strip() == "Dark"
+        except Exception:
+            # If detection fails for any reason, fall back to the light palette
+            return False
+
+    def _apply_theme(self):
+        """
+        Choose row/text colors based on the OS appearance and apply them to
+        the Treeview style. Row tag colors are stored on self for use when
+        rows are inserted in _load_page().
+        """
+        if self._detect_dark_mode():
+            # Dark mode: dark striped rows with light text
+            self.odd_row_color = "#3A3A3A"  # Lighter gray for odd rows
+            self.even_row_color = "#2B2B2B"  # Darker gray for even rows
+            self.row_text_color = "#E8E8E8"  # Near-white text
+            field_bg = "#1E1E1E"  # Empty area below the rows
+            selected_bg = "#0A84FF"  # macOS system blue
+        else:
+            # Light mode: original light striped rows with dark text
+            self.odd_row_color = "#F0F0F0"  # Light gray for odd rows
+            self.even_row_color = "#FFFFFF"  # White for even rows
+            self.row_text_color = "#000000"  # Black text
+            field_bg = "#FFFFFF"
+            selected_bg = "#0078D7"
+
+        # Apply the body colors. tag foreground (set in _load_page) takes
+        # precedence per-row, but setting it here too keeps the empty area
+        # and any untagged rows consistent.
+        self.style.configure(
+            "Treeview",
+            background=field_bg,
+            fieldbackground=field_bg,
+            foreground=self.row_text_color,
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", selected_bg)],
+            foreground=[("selected", "#FFFFFF")],
+        )
 
     def on_horizontal_mousewheel(self, event):
         """
@@ -134,7 +203,7 @@ class LazyCSVViewerGUI:
         ttk.Label(top_controls, text="Delimiter:").pack(side=tk.LEFT, padx=(10, 0))
 
         # Delimiter dropdown
-        self.delimiter_var = tk.StringVar(value="\t")
+        self.delimiter_var = tk.StringVar(value=",")
         self.delimiter_dropdown = ttk.Combobox(
             top_controls, textvariable=self.delimiter_var, state="readonly", width=15
         )
@@ -143,7 +212,7 @@ class LazyCSVViewerGUI:
         self.delimiter_dropdown["values"] = [
             display for _, display in self.delimiter_options
         ]
-        self.delimiter_dropdown.current(1)  # Default to Tab
+        self.delimiter_dropdown.current(0)  # Default to Comma
         self.delimiter_dropdown.pack(side=tk.LEFT, padx=5)
 
         # Bind delimiter change event
@@ -224,7 +293,9 @@ class LazyCSVViewerGUI:
         self.prev_button.grid(row=3, column=0, pady=5)
 
         # Add page number label between the buttons
-        self.page_label = ttk.Label(self.frame, text="Page 1", font=("Helvetica", 10))
+        self.page_label = ttk.Label(
+            self.frame, text="No file loaded", font=("Helvetica", 10)
+        )
         self.page_label.grid(row=3, column=0, columnspan=2, pady=5)
 
         self.next_button = ttk.Button(
@@ -262,6 +333,7 @@ class LazyCSVViewerGUI:
             if new_page_size > 0:
                 self.page_size = new_page_size
                 self.current_page = 0  # Reset to first page
+                self.page_offsets = {}  # Boundaries depend on page size
                 if self.file_path:  # Only reload if a file is already loaded
                     self._load_page()
             else:
@@ -393,30 +465,172 @@ class LazyCSVViewerGUI:
     def open_file(self):
         """Open a file dialog and load the selected CSV file."""
         path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
-        if path:
-            self.file_path = path
-            self.current_page = 0  # Reset to first page
-            self.hidden_columns.clear()  # Clear hidden columns for new file
-            self._load_page()
-            # Enable column visibility button once a file is loaded
-            self.column_visibility_button.config(state="normal")
+        if not path:
+            return
+
+        # Figure out the text encoding before committing to the file
+        encoding = self._detect_encoding(path)
+        if encoding is None:
+            messagebox.showerror("Error", "Could not read the selected file.")
+            return
+
+        self.file_path = path
+        self.encoding = encoding
+        self.current_page = 0  # Reset to first page
+        self.hidden_columns.clear()  # Clear hidden columns for new file
+        self.page_offsets = {}  # Offsets are file-specific; drop the old ones
+
+        # Estimate the total row count from a bounded sample (never a full scan,
+        # so opening a huge file stays instant).
+        self.total_rows, self.total_is_estimate = self._estimate_total_rows(path)
+
+        # Auto-detect the delimiter and sync the dropdown before loading
+        self._auto_detect_delimiter(path, encoding)
+        self._load_page()
+
+    def _estimate_total_rows(self, path):
+        """
+        Determine the number of data rows (excluding the header) without ever
+        scanning more than a 1 MB sample. Returns (count, is_estimate).
+
+        If the whole file fits in the sample it is parsed for an EXACT count
+        (is_estimate False). Otherwise the count is extrapolated from the sample
+        and file size via newline density (is_estimate True) -- approximate
+        because multi-line quoted fields inflate the newline count, but it never
+        touches more than 1 MB regardless of file size. Returns (None, False)
+        when no count can be derived.
+        """
+        try:
+            filesize = os.path.getsize(path)
+            if filesize == 0:
+                return 0, False
+            sample_size = min(filesize, 1 << 20)  # 1 MB
+            with open(path, "rb") as f:
+                sample = f.read(sample_size)
+        except OSError:
+            return None, False
+
+        if sample_size == filesize:
+            # Whole file is in the sample -> parse it for an exact row count.
+            # Cheap (<=1 MB) and correct even with multi-line quoted fields.
+            # Row boundaries don't depend on the delimiter, so the default is fine.
+            text = sample.decode(self.encoding, errors="replace")
+            rows = sum(1 for _ in csv.reader(io.StringIO(text)))
+            return max(0, rows - 1), False  # minus the header row
+
+        newlines = sample.count(b"\n")
+        if newlines == 0:
+            return None, False  # no line boundary in 1 MB -> can't extrapolate
+        bytes_per_line = sample_size / newlines
+        est_lines = filesize / bytes_per_line
+        return max(0, int(est_lines) - 1), True  # minus the header row
+
+    def _detect_encoding(self, path):
+        """
+        Return the first encoding that can decode a sample of the file, or
+        None if the file can't be read at all. latin-1 is the last resort
+        because it can decode any byte sequence, so this never reports a
+        readable file as undecodable.
+        """
+        try:
+            with open(path, "rb") as f:
+                sample = f.read(65536)
+        except OSError:
+            return None
+
+        # Trim to the last complete line so a multi-byte character split at the
+        # sample boundary doesn't cause a false decode failure.
+        newline = sample.rfind(b"\n")
+        if newline != -1:
+            sample = sample[: newline + 1]
+
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                sample.decode(encoding)
+                return encoding
+            except UnicodeDecodeError:
+                continue
+        return "latin-1"
+
+    def _auto_detect_delimiter(self, path, encoding):
+        """
+        Sniff the delimiter from a sample and sync self.delimiter and the
+        dropdown to match. Leaves the current selection untouched if detection
+        is inconclusive. Space is excluded from sniffing to avoid false hits on
+        prose; it stays available for manual selection.
+        """
+        try:
+            with open(path, "r", newline="", encoding=encoding) as f:
+                sample = f.read(8192)
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+            detected = dialect.delimiter
+        except (csv.Error, OSError):
+            return  # keep whatever delimiter is currently selected
+
+        for index, (delim, _) in enumerate(self.delimiter_options):
+            if delim == detected:
+                self.delimiter = delim
+                self.delimiter_dropdown.current(index)
+                break
 
     def _load_page(self):
         """
-        Load and display the current page of CSV data in the treeview.
-        Handles pagination and column setup.
+        Load the current page, surfacing any read/parse problem as a dialog
+        instead of crashing. Delegates the actual rendering to _render_page().
         """
         if not self.file_path:
             return
+        try:
+            self._render_page()
+        except StopIteration:
+            # next(reader) on the header failed -> the file has no rows
+            messagebox.showerror("Empty file", "This file has no data to display.")
+            self._reset_view()
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            messagebox.showerror("Error", f"Could not read the file:\n{exc}")
+            self._reset_view()
 
-        # Calculate starting row based on current page
-        start = self.current_page * self.page_size
+    def _row_iter(self, f):
+        """
+        Yield lines from f while recording the byte offset after each line in
+        self._byte_pos. csv.reader pulls lines through this, so once it yields a
+        complete row, self._byte_pos is the offset of the start of the next row.
+        readline() (not the file iterator) is used because it keeps tell()
+        accurate, which the read-ahead file iterator does not.
+        """
+        while True:
+            line = f.readline()
+            if not line:
+                return
+            self._byte_pos = f.tell()
+            yield line
 
-        with open(self.file_path, "r", newline="", encoding="utf-8") as f:
-            # Create CSV reader with selected delimiter
-            reader = csv.reader(f, delimiter=self.delimiter)
-            header = next(reader)  # Read header row
+    def _render_page(self):
+        """
+        Render the current page of CSV data into the treeview, handling
+        pagination and column setup. Navigation uses cached byte offsets so a
+        page load seeks straight to the page instead of re-scanning from the top.
+        """
+        with open(self.file_path, "r", newline="", encoding=self.encoding) as f:
+            reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
+            header = next(reader)  # Read header row (StopIteration -> empty file)
             self.column_headers = header  # Store for reference
+            # The position right after the header is the start of page 0's data
+            self.page_offsets.setdefault(0, self._byte_pos)
+
+            # Jump straight to the current page if we know where it starts;
+            # otherwise fall back to a sequential skip from the first data row.
+            if self.current_page in self.page_offsets:
+                offset = self.page_offsets[self.current_page]
+                f.seek(offset)
+                self._byte_pos = offset
+                reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
+            else:
+                for _ in range(self.current_page * self.page_size):
+                    try:
+                        next(reader)
+                    except StopIteration:
+                        break
 
             # Enable column visibility button since we now have column data
             self.column_visibility_button.config(state="normal")
@@ -435,15 +649,10 @@ class LazyCSVViewerGUI:
                 self.tree.heading(i, text=header[i])
                 self.tree.column(i, anchor="w")  # Left-align text
 
-            # Skip to current page position
-            for _ in range(start):
-                try:
-                    next(reader)
-                except StopIteration:
-                    break  # End of file reached while skipping
-
             # Load rows for current page
             row_count = 0
+            next_page_offset = None
+            self.has_next_page = False
             for row in reader:
                 if row_count < self.page_size:
                     # Handle rows with fewer columns than header by padding with empty strings
@@ -454,38 +663,78 @@ class LazyCSVViewerGUI:
                     tag = "odd" if row_count % 2 else "even"
                     self.tree.insert("", "end", values=visible_row, tags=(tag,))
                     row_count += 1
+                    # Capture the page boundary before peeking at the next row
+                    if row_count == self.page_size:
+                        next_page_offset = self._byte_pos
                 else:
                     # More rows exist beyond this page
                     self.has_next_page = True
                     break
-            else:
-                # If loop completed normally (not via break),
-                # we've reached the end of the file
-                self.has_next_page = False
 
-            # Configure row tags for alternating colors
-            self.tree.tag_configure("even", background=self.odd_row_color)
-            self.tree.tag_configure("odd", background=self.even_row_color)
+            # Remember where the next page starts so Next is an O(1) seek
+            if self.has_next_page and next_page_offset is not None:
+                self.page_offsets[self.current_page + 1] = next_page_offset
+
+            # Configure row tags for alternating colors (with a readable text
+            # color for the current light/dark palette)
+            self.tree.tag_configure(
+                "even", background=self.odd_row_color, foreground=self.row_text_color
+            )
+            self.tree.tag_configure(
+                "odd", background=self.even_row_color, foreground=self.row_text_color
+            )
+
+        # Keep the row indicator and nav buttons in sync with the loaded page
+        self.page_label.config(text=self._page_label_text(row_count))
+        self._update_nav_buttons()
+
+    def _page_label_text(self, row_count):
+        """Build the 'Rows A-B of ~N' indicator for the current page."""
+        if row_count == 0:
+            return "No rows"
+        start = self.current_page * self.page_size + 1
+        end = self.current_page * self.page_size + row_count
+        label = f"Rows {start:,}–{end:,}"
+        if self.total_rows is not None:
+            approx = "~" if self.total_is_estimate else ""
+            label += f" of {approx}{self.total_rows:,}"
+        return label
+
+    def _update_nav_buttons(self):
+        """Enable/disable the page nav buttons based on the current position."""
+        self.prev_button.config(
+            state="normal" if self.current_page > 0 else "disabled"
+        )
+        self.next_button.config(
+            state="normal" if self.has_next_page else "disabled"
+        )
+
+    def _reset_view(self):
+        """Clear the view back to an empty state after a failed load."""
+        self.file_path = None
+        self.tree.delete(*self.tree.get_children())
+        self.tree["columns"] = ()
+        self.column_headers = []
+        self.has_next_page = False
+        self.current_page = 0
+        self.page_offsets = {}
+        self.total_rows = None
+        self.total_is_estimate = False
+        self.page_label.config(text="No file loaded")
+        self.column_visibility_button.config(state="disabled")
+        self._update_nav_buttons()
 
     def next_page(self):
         """Navigate to the next page of data if available."""
         if self.has_next_page:
             self.current_page += 1
             self._load_page()
-            # Update the page label
-            self.page_label.config(text=f"Page {self.current_page + 1}")
-        else:
-            messagebox.showinfo("End", "You are at the end of the file.")
 
     def prev_page(self):
         """Navigate to the previous page of data if available."""
         if self.current_page > 0:
             self.current_page -= 1
             self._load_page()
-            # Update the page label
-            self.page_label.config(text=f"Page {self.current_page + 1}")
-        else:
-            messagebox.showinfo("Start", "You are at the start of the file.")
 
 
 if __name__ == "__main__":

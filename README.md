@@ -49,7 +49,7 @@ The executable will be created in the `dist` directory.
 4. Navigate through the data using the "Previous Page" and "Next Page" buttons
 5. Customize your view:
    - Adjust page size with the "Page Size" field and "Apply" button
-   - Toggle column expansion with "Expand/Collapse All Columns"
+   - Toggle column width with the "Expand Columns" / "Collapse Columns" button
    - Show/hide specific columns with the "Show/Hide Columns" button
 
 ### Keyboard Shortcuts

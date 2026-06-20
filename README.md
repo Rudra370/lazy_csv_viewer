@@ -4,15 +4,20 @@ A lightweight, efficient CSV viewer application that loads and displays CSV file
 
 ## Features
 
-- **Page-by-page loading**: Handle large CSV files efficiently by loading only what you need
-- **Flexible delimiter support**: View files with different delimiters (comma, tab, semicolon, pipe, space)
+- **Page-by-page loading**: Open huge CSV files in a fraction of a second — only the current page is read, and Next/Previous seek directly to each page
+- **Row count**: Shows `Rows A–B of N`, using a bounded sample estimate (`~N`) that is refined to the exact total in the background
+- **Search**: File-wide "Find Next" with wrap-around; runs in the background and can be cancelled
+- **Filter**: Show only rows matching a query, paged across the whole file
+- **Go to row**: Jump straight to any row number
+- **Detail view**: Double-click a row to see the full record (every field, untruncated, including hidden columns)
+- **Flexible delimiter support**: Auto-detected on open; comma, tab, semicolon, pipe, or space
+- **Encoding-aware**: Detects UTF-8 (incl. BOM), Windows-1252, and Latin-1 so non-UTF-8 files open without errors
+- **No-header mode**: Treat the first row as data and auto-name the columns
 - **Customizable page size**: Adjust how many rows to load at once
-- **Column management**:
-  - Show/hide specific columns
-  - Expand or collapse column widths
-- **Navigation**:
-  - Horizontal scrolling (mouse wheel with Shift key or arrow keys)
-  - Previous/Next page buttons
+- **Column management**: Show/hide columns, auto-fit to content, or expand to full width; a left row-number column
+- **Copy**: Right-click to copy a cell, row, or column
+- **Recent files & persistence**: Remembers window size, page size, delimiter, and recently opened files
+- **Dark mode**: Matches the macOS appearance and re-themes live when you toggle it
 - **Improved readability**: Alternating row colors for easier reading
 
 ## Installation
@@ -30,16 +35,22 @@ A lightweight, efficient CSV viewer application that loads and displays CSV file
    python main.py
    ```
 
-### Option 2: Standalone Executable
+### Option 2: Standalone macOS App
 
-You can build a standalone executable using PyInstaller:
+Build a double-clickable `.app` bundle (generates an icon and runs PyInstaller).
+On Homebrew Python the system `pip` is locked down, so install tools into a
+virtualenv first:
 
 ```
+python3 -m venv .venv
+source .venv/bin/activate
 pip install pyinstaller
-pyinstaller --onefile --noconsole main.py
+./build.sh
 ```
 
-The executable will be created in the `dist` directory.
+The bundle is created at `dist/Lazy CSV Viewer.app` — launch it with
+`open "dist/Lazy CSV Viewer.app"`. On other platforms, PyInstaller still works;
+run it directly (`python -m PyInstaller --windowed main.py`).
 
 ## Usage
 
@@ -54,16 +65,31 @@ The executable will be created in the `dist` directory.
 
 ### Keyboard Shortcuts
 
-- `Left Arrow`: Scroll left
-- `Right Arrow`: Scroll right
-- `Shift + Left Arrow`: Scroll left faster
-- `Shift + Right Arrow`: Scroll right faster
+- `Left Arrow` / `Right Arrow`: Scroll left / right
+- `Shift + Left/Right Arrow`: Scroll faster
 - `Shift + Mouse Wheel`: Horizontal scrolling
+- `Cmd/Ctrl + Left/Right Arrow`: Previous / Next page
+- `Cmd/Ctrl + F`: Focus the search box
+- `Cmd/Ctrl + O`: Open a file
+- `Enter` in the search box: Find next match
+
+## Development
+
+The tests require `tkinter` and a display. On Homebrew Python the system `pip`
+is externally managed, so use a virtualenv (it inherits `tkinter` from the base
+install):
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pytest
+python -m pytest
+```
 
 ## Requirements
 
 - Python 3.6 or higher
-- Tkinter (usually included with Python)
+- Tkinter (usually included with Python; on Homebrew Python install `python-tk`)
 
 ## License
 

@@ -10,6 +10,57 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 
+def scan_for_match(
+    path,
+    encoding,
+    delimiter,
+    query_lower,
+    has_header,
+    start_idx,
+    stop_idx=None,
+    start_offset=0,
+    start_offset_idx=0,
+    cancel_event=None,
+):
+    """
+    Return the absolute 0-based data-row index of the first row at/after
+    start_idx (and before stop_idx, if given) whose cells contain query_lower,
+    or None if there is no such row. Returns the string "cancelled" if
+    cancel_event fires mid-scan.
+
+    Pure function (no shared state) so it is safe to run on a worker thread and
+    easy to unit-test. If start_offset/start_offset_idx are given they must
+    correspond (a byte offset and the row index that begins there) and are used
+    to seek straight to the start instead of reading from the top.
+    """
+    with open(path, "r", newline="", encoding=encoding, errors="replace") as f:
+        if start_offset and start_offset_idx > 0:
+            f.seek(start_offset)
+            idx = start_offset_idx
+        else:
+            idx = 0
+            if has_header:
+                if not f.readline():
+                    return None
+        reader = csv.reader(f, delimiter=delimiter)
+        checked = 0
+        for row in reader:
+            if (
+                cancel_event is not None
+                and (checked & 0x1FFF) == 0
+                and cancel_event.is_set()
+            ):
+                return "cancelled"
+            checked += 1
+            if idx >= start_idx:
+                if stop_idx is not None and idx >= stop_idx:
+                    break
+                if any(query_lower in cell.lower() for cell in row):
+                    return idx
+            idx += 1
+    return None
+
+
 class LazyCSVViewerGUI:
     """
     A simple CSV viewer application that loads and displays CSV files page by page.
@@ -42,9 +93,11 @@ class LazyCSVViewerGUI:
         self.scroll_speed = 20  # Controls how fast horizontal scrolling moves
         self.delimiter = ","  # Default delimiter (comma)
         self.encoding = "utf-8"  # Detected per-file when a file is opened
+        self.has_header = True  # False => treat row 1 as data, synth column names
         self.expand_columns = False  # False = fit-to-window, True = full content width
         self.hidden_columns = set()  # Track hidden columns
         self.column_headers = []  # Store column headers for reference
+        self._page_full_rows = []  # Full (unfiltered-columns) rows for the detail view
         self.delimiter_options = [
             (",", "Comma (,)"),
             ("\t", "Tab (\\t)"),
@@ -53,15 +106,30 @@ class LazyCSVViewerGUI:
             (" ", "Space ( )"),
         ]
 
-        # Search / navigation state
-        self._search_query = None  # Last query, to know when to restart a search
-        self._last_match_row = -1  # Absolute index of the last search match
+        # Search state (search runs on a worker thread, cancelable)
+        self._search_query = None
+        self._last_match_row = -1
+        self._search_queue = queue.Queue()
+        self._search_token = 0
+        self._search_cancel = threading.Event()
+        self._searching = False
 
-        # Background row-count state (exact count for big files, off the UI thread)
+        # Filter state (show only matching rows, paged, scanned lazily)
+        self.filter_active = False
+        self.filter_query = None
+        self.filter_matches = []  # list of (abs_idx, full_padded_row)
+        self.filter_scan_offset = None  # byte offset to resume scanning
+        self.filter_scan_idx = 0  # next absolute row index to read
+        self.filter_exhausted = False
+
+        # Background exact-count state (off the UI thread)
         self._count_queue = queue.Queue()
-        self._count_token = 0  # Bumped per file to ignore stale worker results
+        self._count_token = 0
 
-        # Persisted settings (window size, recent files, last delimiter, ...)
+        # Live appearance tracking (re-theme on macOS dark/light toggle)
+        self._dark_mode = False
+
+        # Persisted settings
         self.config_path = os.path.join(
             os.path.expanduser("~"), ".lazy_csv_viewer.json"
         )
@@ -81,15 +149,21 @@ class LazyCSVViewerGUI:
         self._setup_bindings()
         self._setup_context_menu()
 
-        # Nav buttons start disabled until a file is loaded
         self._update_nav_buttons()
-
-        # Restore window geometry (or fill the screen by default)
         self._apply_initial_geometry()
 
-        # Save settings on close; poll for background row-count results
+        # Save on close; start the background pollers
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # On macOS, Cmd+Q and the app-menu Quit bypass WM_DELETE_WINDOW; route
+        # them through the same handler so settings are still saved.
+        if sys.platform == "darwin":
+            try:
+                self.root.createcommand("tk::mac::Quit", self._on_close)
+            except tk.TclError:
+                pass
         self.root.after(300, self._poll_count_queue)
+        self.root.after(150, self._poll_search_queue)
+        self.root.after(3000, self._poll_appearance)
 
     # ------------------------------------------------------------------ config
 
@@ -177,33 +251,30 @@ class LazyCSVViewerGUI:
             )
             return result.stdout.strip() == "Dark"
         except Exception:
-            # If detection fails for any reason, fall back to the light palette
             return False
 
     def _apply_theme(self):
         """
-        Choose row/text colors based on the OS appearance and apply them to
-        the Treeview style. Row tag colors are stored on self for use when
-        rows are inserted in _render_page().
+        Choose row/text colors based on the OS appearance and apply them to the
+        Treeview style. Row tag colors are stored on self for use when rows are
+        inserted in _display().
         """
-        if self._detect_dark_mode():
+        self._dark_mode = self._detect_dark_mode()
+        if self._dark_mode:
             # Dark mode: dark striped rows with light text
-            self.odd_row_color = "#3A3A3A"  # Lighter gray for odd rows
-            self.even_row_color = "#2B2B2B"  # Darker gray for even rows
-            self.row_text_color = "#E8E8E8"  # Near-white text
-            field_bg = "#1E1E1E"  # Empty area below the rows
-            selected_bg = "#0A84FF"  # macOS system blue
+            self.odd_row_color = "#3A3A3A"
+            self.even_row_color = "#2B2B2B"
+            self.row_text_color = "#E8E8E8"
+            field_bg = "#1E1E1E"
+            selected_bg = "#0A84FF"
         else:
             # Light mode: original light striped rows with dark text
-            self.odd_row_color = "#F0F0F0"  # Light gray for odd rows
-            self.even_row_color = "#FFFFFF"  # White for even rows
-            self.row_text_color = "#000000"  # Black text
+            self.odd_row_color = "#F0F0F0"
+            self.even_row_color = "#FFFFFF"
+            self.row_text_color = "#000000"
             field_bg = "#FFFFFF"
             selected_bg = "#0078D7"
 
-        # Apply the body colors. tag foreground (set in _render_page) takes
-        # precedence per-row, but setting it here too keeps the empty area
-        # and any untagged rows consistent.
         self.style.configure(
             "Treeview",
             background=field_bg,
@@ -216,39 +287,28 @@ class LazyCSVViewerGUI:
             foreground=[("selected", "#FFFFFF")],
         )
 
+    def _poll_appearance(self):
+        """Re-theme if the macOS appearance changed since the last check."""
+        if self._detect_dark_mode() != self._dark_mode:
+            self._apply_theme()
+            if self.file_path:
+                self._load_page()  # re-render so row tags pick up the new colors
+        self.root.after(3000, self._poll_appearance)
+
     # ----------------------------------------------------------- scroll helpers
 
     def on_horizontal_mousewheel(self, event):
-        """
-        Handle horizontal scrolling with the mousewheel when Shift is pressed.
-
-        Args:
-            event: The mousewheel event
-
-        Returns:
-            str: "break" to prevent default behavior
-        """
-        # Windows and macOS have different mousewheel directions
+        """Handle horizontal scrolling with the mousewheel when Shift is pressed."""
         direction = -1 if event.delta > 0 else 1
         amount = direction * (self.scroll_speed / 1000)
         current = self.tree.xview()[0]
-
-        # Ensure scrolling stays within bounds (0 to 1)
         self.tree.xview_moveto(max(0, min(1, current + amount)))
-        return "break"  # Prevent default behavior
+        return "break"
 
     def scroll_horizontal(self, units):
-        """
-        Scroll the treeview horizontally by the specified number of units.
-
-        Args:
-            units: Number of units to scroll (positive for right, negative for left)
-        """
-        # Calculate scroll amount based on number of units
+        """Scroll the treeview horizontally by the specified number of units."""
         amount = units * (self.scroll_speed / 100)
         current = self.tree.xview()[0]
-
-        # Ensure scrolling stays within bounds (0 to 1)
         self.tree.xview_moveto(max(0, min(1, current + amount)))
 
     # ------------------------------------------------------------- ui assembly
@@ -281,88 +341,87 @@ class LazyCSVViewerGUI:
 
     def _setup_widgets(self):
         """Create and arrange all UI widgets for the application."""
-        # Main frame with padding
         self.frame = ttk.Frame(self.root, padding="10")
         self.frame.grid(row=0, column=0, sticky="nsew")
 
-        # --- Top controls (file / delimiter / page size / columns) ------------
-        top_controls = ttk.Frame(self.frame)
-        top_controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=5)
+        # --- Top controls -----------------------------------------------------
+        top = ttk.Frame(self.frame)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=5)
 
-        self.open_button = ttk.Button(
-            top_controls, text="Open CSV File", command=self.open_file
-        )
-        self.open_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.open_button = ttk.Button(top, text="Open CSV File", command=self.open_file)
+        self.open_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.reload_button = ttk.Button(top, text="Reload", command=self.reload_file)
+        self.reload_button.pack(side=tk.LEFT, padx=(0, 10))
 
-        ttk.Label(top_controls, text="Delimiter:").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(top, text="Delimiter:").pack(side=tk.LEFT, padx=(10, 0))
         self.delimiter_var = tk.StringVar(value=self.delimiter)
         self.delimiter_dropdown = ttk.Combobox(
-            top_controls, textvariable=self.delimiter_var, state="readonly", width=15
+            top, textvariable=self.delimiter_var, state="readonly", width=15
         )
-        self.delimiter_dropdown["values"] = [
-            display for _, display in self.delimiter_options
-        ]
+        self.delimiter_dropdown["values"] = [d for _, d in self.delimiter_options]
         self._select_delimiter_in_dropdown()
         self.delimiter_dropdown.pack(side=tk.LEFT, padx=5)
         self.delimiter_dropdown.bind("<<ComboboxSelected>>", self._on_delimiter_changed)
 
-        ttk.Label(top_controls, text="Page Size:").pack(side=tk.LEFT, padx=(20, 0))
-        self.page_size_var = tk.StringVar(value=str(self.page_size))
-        self.page_size_entry = ttk.Entry(
-            top_controls, textvariable=self.page_size_var, width=6
+        self.no_header_var = tk.BooleanVar(value=False)
+        self.no_header_check = ttk.Checkbutton(
+            top, text="No header row", variable=self.no_header_var,
+            command=self.toggle_header,
         )
+        self.no_header_check.pack(side=tk.LEFT, padx=(12, 0))
+
+        ttk.Label(top, text="Page Size:").pack(side=tk.LEFT, padx=(16, 0))
+        self.page_size_var = tk.StringVar(value=str(self.page_size))
+        self.page_size_entry = ttk.Entry(top, textvariable=self.page_size_var, width=6)
         self.page_size_entry.pack(side=tk.LEFT, padx=5)
         self.page_size_entry.bind("<Return>", lambda e: self._on_page_size_changed())
-        self.apply_page_size_button = ttk.Button(
-            top_controls, text="Apply", command=self._on_page_size_changed
+        ttk.Button(top, text="Apply", command=self._on_page_size_changed).pack(
+            side=tk.LEFT
         )
-        self.apply_page_size_button.pack(side=tk.LEFT)
 
         self.expand_columns_button = ttk.Button(
-            top_controls, text="Expand Columns", command=self._toggle_expand_columns
+            top, text="Expand Columns", command=self._toggle_expand_columns
         )
         self.expand_columns_button.pack(side=tk.LEFT, padx=(10, 0))
-
         self.column_visibility_button = ttk.Button(
-            top_controls,
-            text="Show/Hide Columns",
-            command=self._show_column_selector,
-            state="disabled",  # Disabled until a file is loaded
+            top, text="Show/Hide Columns", command=self._show_column_selector,
+            state="disabled",
         )
         self.column_visibility_button.pack(side=tk.LEFT, padx=(10, 0))
 
-        # --- Second controls row (search / jump) ------------------------------
-        search_controls = ttk.Frame(self.frame)
-        search_controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        # --- Search / filter / jump row --------------------------------------
+        search = ttk.Frame(self.frame)
+        search.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 5))
 
-        ttk.Label(search_controls, text="Search:").pack(side=tk.LEFT, padx=(0, 0))
+        ttk.Label(search, text="Search:").pack(side=tk.LEFT)
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(
-            search_controls, textvariable=self.search_var, width=28
-        )
+        self.search_entry = ttk.Entry(search, textvariable=self.search_var, width=26)
         self.search_entry.pack(side=tk.LEFT, padx=5)
         self.search_entry.bind("<Return>", self.find_next)
-        self.find_button = ttk.Button(
-            search_controls, text="Find Next", command=self.find_next
-        )
+        self.find_button = ttk.Button(search, text="Find Next", command=self.find_next)
         self.find_button.pack(side=tk.LEFT)
-        self.search_status = ttk.Label(search_controls, text="", width=18)
+        self.cancel_button = ttk.Button(
+            search, text="Cancel", command=self.cancel_search, state="disabled"
+        )
+        self.cancel_button.pack(side=tk.LEFT, padx=(4, 0))
+        self.filter_var = tk.BooleanVar(value=False)
+        self.filter_check = ttk.Checkbutton(
+            search, text="Filter", variable=self.filter_var, command=self.toggle_filter
+        )
+        self.filter_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.search_status = ttk.Label(search, text="", width=20)
         self.search_status.pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(search_controls, text="Go to row:").pack(side=tk.LEFT, padx=(20, 0))
+        ttk.Label(search, text="Go to row:").pack(side=tk.LEFT, padx=(16, 0))
         self.row_var = tk.StringVar()
-        self.row_entry = ttk.Entry(search_controls, textvariable=self.row_var, width=10)
+        self.row_entry = ttk.Entry(search, textvariable=self.row_var, width=10)
         self.row_entry.pack(side=tk.LEFT, padx=5)
-        self.row_entry.bind("<Return>", self.go_to_row)
-        self.go_button = ttk.Button(
-            search_controls, text="Go", command=self.go_to_row
-        )
-        self.go_button.pack(side=tk.LEFT)
+        self.row_entry.bind("<Return>", lambda e: self.go_to_row())
+        ttk.Button(search, text="Go", command=self.go_to_row).pack(side=tk.LEFT)
 
         # --- Data table -------------------------------------------------------
         self.tree = ttk.Treeview(self.frame, show="headings")
         self.tree.grid(row=2, column=0, columnspan=2, sticky="nsew")
-
         self.scrollbar = ttk.Scrollbar(
             self.frame, orient="vertical", command=self.tree.yview
         )
@@ -389,7 +448,6 @@ class LazyCSVViewerGUI:
         )
         self.next_button.grid(row=4, column=1, pady=5)
 
-        # Configure grid weights for proper resizing
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
         self.frame.grid_rowconfigure(2, weight=1)
@@ -406,7 +464,6 @@ class LazyCSVViewerGUI:
 
     def _setup_bindings(self):
         """Set up keyboard shortcuts and mouse bindings for the application."""
-        # Horizontal scrolling with arrow keys
         self.root.bind("<Left>", lambda e: self.scroll_horizontal(-1))
         self.root.bind("<Right>", lambda e: self.scroll_horizontal(1))
         self.root.bind("<Shift-Left>", lambda e: self.scroll_horizontal(-5))
@@ -418,27 +475,25 @@ class LazyCSVViewerGUI:
         self.root.bind("<Control-Right>", lambda e: self.next_page())
         self.root.bind("<Control-Left>", lambda e: self.prev_page())
 
-        # Focus the search box with Cmd/Ctrl+F
         self.root.bind("<Command-f>", lambda e: self.search_entry.focus_set())
         self.root.bind("<Control-f>", lambda e: self.search_entry.focus_set())
-
-        # Open with Cmd/Ctrl+O
         self.root.bind("<Command-o>", lambda e: self.open_file())
         self.root.bind("<Control-o>", lambda e: self.open_file())
 
-        # Horizontal scroll with Shift+wheel, and focus the tree on click
         self.tree.bind("<Shift-MouseWheel>", self.on_horizontal_mousewheel)
         self.tree.bind("<Button-1>", lambda e: self.tree.focus_set())
+        self.tree.bind("<Double-Button-1>", self._show_detail)
 
     def _setup_context_menu(self):
-        """Right-click menu on the table: copy cell / row / column."""
+        """Right-click menu on the table: view record / copy cell / row / column."""
         self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="View Record…", command=self._show_detail)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="Copy Cell", command=self._copy_cell)
         self.context_menu.add_command(label="Copy Row", command=self._copy_row)
         self.context_menu.add_command(label="Copy Column", command=self._copy_column)
         self._ctx_item = None
         self._ctx_col = None
-        # Right-click is Button-3 on most platforms, Button-2 / Ctrl-click on macOS
         for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
             self.tree.bind(seq, self._show_context_menu)
 
@@ -484,8 +539,7 @@ class LazyCSVViewerGUI:
         if not self._ctx_item:
             return
         values = self.tree.item(self._ctx_item, "values")
-        # Skip the leading row-number column
-        self._set_clipboard("\t".join(str(v) for v in values[1:]))
+        self._set_clipboard("\t".join(str(v) for v in values[1:]))  # skip rownum
 
     def _copy_column(self):
         i = self._display_col_index(self._ctx_col)
@@ -498,6 +552,79 @@ class LazyCSVViewerGUI:
                 column.append(str(values[i]))
         self._set_clipboard("\n".join(column))
 
+    # ------------------------------------------------------------ detail view
+
+    def _show_detail(self, event=None):
+        """Open a popup with the full record for the selected (or clicked) row."""
+        item = None
+        if event is not None:
+            clicked = self.tree.identify_row(event.y)
+            if clicked:
+                item = clicked
+        if item is None:
+            sel = self.tree.selection()
+            item = sel[0] if sel else None
+        if not item:
+            return
+        children = self.tree.get_children()
+        try:
+            pos = children.index(item)
+        except ValueError:
+            return
+        if pos >= len(self._page_full_rows):
+            return
+        rownum = self.tree.item(item, "values")[0]
+        self._open_detail_window(rownum, self._page_full_rows[pos])
+
+    def _open_detail_window(self, rownum, full_row):
+        """Build the scrollable record popup for one row."""
+        win = tk.Toplevel(self.root)
+        win.title(f"Record — row {rownum}")
+        win.transient(self.root)
+
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, highlightthickness=0)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        headers = self.column_headers
+        for i, name in enumerate(headers):
+            value = str(full_row[i]) if i < len(full_row) else ""
+            ttk.Label(inner, text=str(name), font=("Helvetica", 10, "bold")).grid(
+                row=i, column=0, sticky="nw", padx=(0, 10), pady=3
+            )
+            text = tk.Text(inner, width=60, wrap="word", height=min(5, value.count("\n") + 1))
+            text.insert("1.0", value)
+            text.configure(state="disabled")
+            text.grid(row=i, column=1, sticky="ew", pady=3)
+            ttk.Button(
+                inner, text="Copy", command=lambda v=value: self._set_clipboard(v)
+            ).grid(row=i, column=2, padx=5)
+        inner.grid_columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(win, padding=(10, 0, 10, 10))
+        buttons.pack(fill=tk.X)
+        ttk.Button(
+            buttons,
+            text="Copy All",
+            command=lambda: self._set_clipboard(
+                "\n".join(
+                    f"{h}\t{full_row[i] if i < len(full_row) else ''}"
+                    for i, h in enumerate(headers)
+                )
+            ),
+        ).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+        win.geometry("620x520")
+
     # --------------------------------------------------------- control events
 
     def _on_delimiter_changed(self, event=None):
@@ -509,6 +636,7 @@ class LazyCSVViewerGUI:
                 break
         # Row boundaries don't depend on the delimiter, so cached offsets stay valid
         if self.file_path:
+            self._reset_filter_index()
             self._load_page()
 
     def _on_page_size_changed(self):
@@ -517,9 +645,11 @@ class LazyCSVViewerGUI:
             new_page_size = int(self.page_size_var.get())
             if new_page_size > 0:
                 self.page_size = new_page_size
-                self.current_page = 0  # Reset to first page
+                self.current_page = 0
                 self.page_offsets = {}  # Boundaries depend on page size
-                if self.file_path:  # Only reload if a file is already loaded
+                self._reset_filter_index()
+                self._save_config()  # persist immediately, regardless of quit method
+                if self.file_path:
                     self._load_page()
             else:
                 messagebox.showerror("Error", "Page size must be a positive integer.")
@@ -535,6 +665,25 @@ class LazyCSVViewerGUI:
         if self.file_path:
             self._load_page()
 
+    def toggle_header(self):
+        """Switch between 'first row is a header' and 'first row is data'."""
+        self.has_header = not self.no_header_var.get()
+        if not self.file_path:
+            return
+        self._count_token += 1
+        self.current_page = 0
+        self.page_offsets = {}
+        self._reset_filter_index()
+        self.total_rows, self.total_is_estimate = self._estimate_total_rows(
+            self.file_path
+        )
+        self._load_page()
+        if self.total_is_estimate:
+            self._start_count(
+                self.file_path, self.encoding, self.delimiter, self.has_header,
+                self._count_token,
+            )
+
     def _show_column_selector(self):
         """Open a popup window with checkboxes to show/hide columns."""
         if not self.column_headers:
@@ -548,7 +697,6 @@ class LazyCSVViewerGUI:
 
         checkbox_frame = ttk.Frame(column_window)
         checkbox_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
         canvas = tk.Canvas(checkbox_frame)
         scrollbar = ttk.Scrollbar(
             checkbox_frame, orient="vertical", command=canvas.yview
@@ -566,33 +714,27 @@ class LazyCSVViewerGUI:
         for i, header in enumerate(self.column_headers):
             var = tk.BooleanVar(value=i not in self.hidden_columns)
             column_vars[i] = var
-            cb = ttk.Checkbutton(scrollable_frame, text=header, variable=var)
-            cb.pack(anchor="w", padx=5, pady=2)
+            ttk.Checkbutton(scrollable_frame, text=header, variable=var).pack(
+                anchor="w", padx=5, pady=2
+            )
 
         button_frame = ttk.Frame(column_window)
         button_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        select_all_btn = ttk.Button(
-            button_frame,
-            text="Select All",
-            command=lambda: [var.set(True) for var in column_vars.values()],
-        )
-        select_all_btn.pack(side=tk.LEFT, padx=5)
-        deselect_all_btn = ttk.Button(
-            button_frame,
-            text="Deselect All",
-            command=lambda: [var.set(False) for var in column_vars.values()],
-        )
-        deselect_all_btn.pack(side=tk.LEFT, padx=5)
-        apply_btn = ttk.Button(
-            button_frame,
-            text="Apply",
+        ttk.Button(
+            button_frame, text="Select All",
+            command=lambda: [v.set(True) for v in column_vars.values()],
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            button_frame, text="Deselect All",
+            command=lambda: [v.set(False) for v in column_vars.values()],
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            button_frame, text="Apply",
             command=lambda: self._apply_column_visibility(column_vars, column_window),
-        )
-        apply_btn.pack(side=tk.RIGHT, padx=5)
-        cancel_btn = ttk.Button(
+        ).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(
             button_frame, text="Cancel", command=column_window.destroy
-        )
-        cancel_btn.pack(side=tk.RIGHT, padx=5)
+        ).pack(side=tk.RIGHT, padx=5)
 
         column_window.update()
         min_width = min(500, column_window.winfo_width())
@@ -609,8 +751,7 @@ class LazyCSVViewerGUI:
             if not var.get():
                 self.hidden_columns.add(col_idx)
         window.destroy()
-        # Hidden columns only affect display, not file offsets -> keep page_offsets
-        self._load_page()
+        self._load_page()  # display-only change; file offsets unaffected
 
     # ----------------------------------------------------------- file opening
 
@@ -624,6 +765,23 @@ class LazyCSVViewerGUI:
         if path:
             self._open_path(path)
 
+    def reload_file(self):
+        """Re-read the current file from disk (e.g. it changed externally)."""
+        if not self.file_path:
+            return
+        self._count_token += 1
+        self.page_offsets = {}
+        self._reset_filter_index()
+        self.total_rows, self.total_is_estimate = self._estimate_total_rows(
+            self.file_path
+        )
+        self._load_page()
+        if self.total_is_estimate:
+            self._start_count(
+                self.file_path, self.encoding, self.delimiter, self.has_header,
+                self._count_token,
+            )
+
     def _open_path(self, path):
         """Load a file by path (shared by the dialog and the Recent menu)."""
         if not os.path.exists(path):
@@ -636,8 +794,7 @@ class LazyCSVViewerGUI:
             messagebox.showerror("Error", "Could not read the selected file.")
             return
 
-        # A new file invalidates any in-flight background count
-        self._count_token += 1
+        self._count_token += 1  # invalidate any in-flight background count
 
         self.file_path = path
         self.encoding = encoding
@@ -646,20 +803,22 @@ class LazyCSVViewerGUI:
         self.page_offsets = {}
         self._search_query = None
         self._last_match_row = -1
+        self._reset_filter_index()
+        self.filter_var.set(False)
+        self.filter_active = False
         self.search_status.config(text="")
         self.last_dir = os.path.dirname(os.path.abspath(path))
 
-        # Bounded estimate first (never a full scan -> instant open)
         self.total_rows, self.total_is_estimate = self._estimate_total_rows(path)
-
         self._auto_detect_delimiter(path, encoding)
         self._add_recent(path)
+        self._save_config()  # persist recent files/last dir even if force-quit
         self._load_page()
 
-        # If the total is only an estimate, refine it to an exact count in the
-        # background so the UI stays responsive on huge files.
         if self.total_is_estimate:
-            self._start_count(path, self.encoding, self.delimiter, self._count_token)
+            self._start_count(
+                path, self.encoding, self.delimiter, self.has_header, self._count_token
+            )
 
     def _add_recent(self, path):
         """Add path to the front of the recent-files list (deduped, capped)."""
@@ -676,16 +835,11 @@ class LazyCSVViewerGUI:
 
     def _estimate_total_rows(self, path):
         """
-        Determine the number of data rows (excluding the header) without ever
-        scanning more than a 1 MB sample. Returns (count, is_estimate).
-
-        If the whole file fits in the sample it is parsed for an EXACT count
-        (is_estimate False). Otherwise the count is extrapolated from the sample
-        and file size via newline density (is_estimate True) -- approximate
-        because multi-line quoted fields inflate the newline count, but it never
-        touches more than 1 MB regardless of file size. Returns (None, False)
-        when no count can be derived.
+        Determine the number of data rows without ever scanning more than a 1 MB
+        sample. Returns (count, is_estimate). Exact when the whole file fits in
+        the sample, extrapolated otherwise. (None, False) when undeterminable.
         """
+        header_rows = 1 if self.has_header else 0
         try:
             filesize = os.path.getsize(path)
             if filesize == 0:
@@ -697,26 +851,22 @@ class LazyCSVViewerGUI:
             return None, False
 
         if sample_size == filesize:
-            # Whole file is in the sample -> parse it for an exact row count.
-            # Cheap (<=1 MB) and correct even with multi-line quoted fields.
-            # Row boundaries don't depend on the delimiter, so the default is fine.
             text = sample.decode(self.encoding, errors="replace")
             rows = sum(1 for _ in csv.reader(io.StringIO(text)))
-            return max(0, rows - 1), False  # minus the header row
+            return max(0, rows - header_rows), False
 
         newlines = sample.count(b"\n")
         if newlines == 0:
-            return None, False  # no line boundary in 1 MB -> can't extrapolate
+            return None, False
         bytes_per_line = sample_size / newlines
         est_lines = filesize / bytes_per_line
-        return max(0, int(est_lines) - 1), True  # minus the header row
+        return max(0, int(est_lines) - header_rows), True
 
     def _detect_encoding(self, path):
         """
-        Return the first encoding that can decode a sample of the file, or
-        None if the file can't be read at all. latin-1 is the last resort
-        because it can decode any byte sequence, so this never reports a
-        readable file as undecodable.
+        Return the first encoding that can decode a sample of the file, or None
+        if it can't be read. latin-1 is the last resort (it decodes any bytes),
+        so a readable file is never reported as undecodable.
         """
         try:
             with open(path, "rb") as f:
@@ -724,8 +874,6 @@ class LazyCSVViewerGUI:
         except OSError:
             return None
 
-        # Trim to the last complete line so a multi-byte character split at the
-        # sample boundary doesn't cause a false decode failure.
         newline = sample.rfind(b"\n")
         if newline != -1:
             sample = sample[: newline + 1]
@@ -739,19 +887,14 @@ class LazyCSVViewerGUI:
         return "latin-1"
 
     def _auto_detect_delimiter(self, path, encoding):
-        """
-        Sniff the delimiter from a sample and sync self.delimiter and the
-        dropdown to match. Leaves the current selection untouched if detection
-        is inconclusive. Space is excluded from sniffing to avoid false hits on
-        prose; it stays available for manual selection.
-        """
+        """Sniff the delimiter from a sample and sync self.delimiter + dropdown."""
         try:
             with open(path, "r", newline="", encoding=encoding) as f:
                 sample = f.read(8192)
             dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
             detected = dialect.delimiter
         except (csv.Error, OSError):
-            return  # keep whatever delimiter is currently selected
+            return
 
         for index, (delim, _) in enumerate(self.delimiter_options):
             if delim == detected:
@@ -761,36 +904,34 @@ class LazyCSVViewerGUI:
 
     # ------------------------------------------------------- background count
 
-    def _start_count(self, path, encoding, delimiter, token):
+    def _start_count(self, path, encoding, delimiter, has_header, token):
         """Spawn a daemon thread to count rows exactly without blocking the UI."""
-        thread = threading.Thread(
+        threading.Thread(
             target=self._count_rows_worker,
-            args=(path, encoding, delimiter, token),
+            args=(path, encoding, delimiter, has_header, token),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
-    def _count_rows_worker(self, path, encoding, delimiter, token):
+    def _count_rows_worker(self, path, encoding, delimiter, has_header, token):
         """Count data rows exactly (off the UI thread); post the result on a queue."""
         try:
             count = 0
             with open(path, "r", newline="", encoding=encoding, errors="replace") as f:
-                reader = csv.reader(f, delimiter=delimiter)
-                for _ in reader:
+                for _ in csv.reader(f, delimiter=delimiter):
                     count += 1
-            self._count_queue.put((token, max(0, count - 1)))  # minus the header
+            self._count_queue.put((token, max(0, count - (1 if has_header else 0))))
         except (OSError, csv.Error):
-            pass  # leave the estimate in place
+            pass
 
     def _poll_count_queue(self):
         """Apply any finished background count for the current file, then reschedule."""
         try:
             while True:
                 token, count = self._count_queue.get_nowait()
-                if token == self._count_token:  # ignore results for old files
+                if token == self._count_token:
                     self.total_rows = count
                     self.total_is_estimate = False
-                    if self.file_path:
+                    if self.file_path and not self.filter_active:
                         self.page_label.config(
                             text=self._page_label_text(len(self.tree.get_children()))
                         )
@@ -802,15 +943,17 @@ class LazyCSVViewerGUI:
 
     def _load_page(self):
         """
-        Load the current page, surfacing any read/parse problem as a dialog
-        instead of crashing. Delegates the actual rendering to _render_page().
+        Load the current page (filtered or not), surfacing read/parse problems
+        as a dialog instead of crashing.
         """
         if not self.file_path:
             return
         try:
-            self._render_page()
+            if self.filter_active:
+                self._render_filter_page()
+            else:
+                self._render_page()
         except StopIteration:
-            # next(reader) on the header failed -> the file has no rows
             messagebox.showerror("Empty file", "This file has no data to display.")
             self._reset_view()
         except (OSError, UnicodeDecodeError, csv.Error) as exc:
@@ -820,10 +963,9 @@ class LazyCSVViewerGUI:
     def _row_iter(self, f):
         """
         Yield lines from f while recording the byte offset after each line in
-        self._byte_pos. csv.reader pulls lines through this, so once it yields a
-        complete row, self._byte_pos is the offset of the start of the next row.
-        readline() (not the file iterator) is used because it keeps tell()
-        accurate, which the read-ahead file iterator does not.
+        self._byte_pos, so once csv.reader yields a complete row, self._byte_pos
+        is the start of the next row. readline() keeps tell() accurate (the
+        read-ahead file iterator does not).
         """
         while True:
             line = f.readline()
@@ -832,21 +974,35 @@ class LazyCSVViewerGUI:
             self._byte_pos = f.tell()
             yield line
 
-    def _render_page(self):
+    def _read_header_and_seek(self, f):
         """
-        Render the current page of CSV data into the treeview, handling
-        pagination and column setup. Navigation uses cached byte offsets so a
-        page load seeks straight to the page instead of re-scanning from the top.
+        Read (or synthesize) the header, set page_offsets[0], and return a reader
+        positioned at the start of the data. Used by both the normal and filter
+        render paths.
         """
-        with open(self.file_path, "r", newline="", encoding=self.encoding) as f:
-            reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
-            header = next(reader)  # Read header row (StopIteration -> empty file)
-            self.column_headers = header  # Store for reference
-            # The position right after the header is the start of page 0's data
+        reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
+        if self.has_header:
+            header = next(reader)
+            self.column_headers = header
             self.page_offsets.setdefault(0, self._byte_pos)
+            return header, reader
+        # No header: peek the first data row only to learn the column count,
+        # then rewind so it is rendered as data.
+        first = next(reader)
+        header = [f"Column {i + 1}" for i in range(len(first))]
+        self.column_headers = header
+        self.page_offsets.setdefault(0, 0)
+        f.seek(0)
+        self._byte_pos = 0
+        reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
+        return header, reader
 
-            # Jump straight to the current page if we know where it starts;
-            # otherwise fall back to a sequential skip (caching offsets en route).
+    def _render_page(self):
+        """Render the current (unfiltered) page using cached byte offsets."""
+        with open(self.file_path, "r", newline="", encoding=self.encoding,
+                  errors="replace") as f:
+            header, reader = self._read_header_and_seek(f)
+
             if self.current_page in self.page_offsets:
                 offset = self.page_offsets[self.current_page]
                 f.seek(offset)
@@ -865,82 +1021,143 @@ class LazyCSVViewerGUI:
                             skipped // self.page_size, self._byte_pos
                         )
 
-            # Enable column visibility button since we now have column data
-            self.column_visibility_button.config(state="normal")
-
-            # Clear existing data from treeview
-            self.tree.delete(*self.tree.get_children())
-
-            # Get indices of visible columns and prepend the row-number column
-            visible_columns = [
-                i for i in range(len(header)) if i not in self.hidden_columns
-            ]
-            columns = [self.ROWNUM_ID] + visible_columns
-            self.tree["columns"] = columns
-            self.tree.heading(self.ROWNUM_ID, text="#")
-            self.tree.column(self.ROWNUM_ID, anchor="e", stretch=False)
-            for i in visible_columns:
-                self.tree.heading(i, text=header[i])
-                self.tree.column(i, anchor="w")
-
-            # Load rows for current page
             row_base = self.current_page * self.page_size
-            row_count = 0
+            rows = []
             next_page_offset = None
             self.has_next_page = False
-            sample_rows = []  # capped sample used to size columns to content
+            count = 0
             for row in reader:
-                if row_count < self.page_size:
-                    # Pad short rows so every visible column has a value
-                    padded_row = row + [""] * (len(header) - len(row))
-                    visible_row = [padded_row[i] for i in visible_columns]
-                    values = [row_base + row_count + 1] + visible_row
-                    tag = "odd" if row_count % 2 else "even"
-                    self.tree.insert("", "end", values=values, tags=(tag,))
-                    if len(sample_rows) < 300:
-                        sample_rows.append(values)
-                    row_count += 1
-                    # Capture the page boundary before peeking at the next row
-                    if row_count == self.page_size:
+                if count < self.page_size:
+                    padded = row + [""] * (len(header) - len(row))
+                    rows.append((row_base + count, padded))
+                    count += 1
+                    if count == self.page_size:
                         next_page_offset = self._byte_pos
                 else:
-                    # More rows exist beyond this page
                     self.has_next_page = True
                     break
 
-            # Remember where the next page starts so Next is an O(1) seek
             if self.has_next_page and next_page_offset is not None:
                 self.page_offsets[self.current_page + 1] = next_page_offset
 
-            # Configure row tags for alternating colors (readable in either palette)
-            self.tree.tag_configure(
-                "even", background=self.odd_row_color, foreground=self.row_text_color
-            )
-            self.tree.tag_configure(
-                "odd", background=self.even_row_color, foreground=self.row_text_color
-            )
+        self._display(header, rows)
 
-            # Size columns to their content (and fill the window in fit mode)
-            self._apply_column_widths(columns, header, sample_rows)
+    def _render_filter_page(self):
+        """Render a page of only the rows matching the active filter."""
+        needed = (self.current_page + 1) * self.page_size
+        self._ensure_filter_matches(needed)
+        start = self.current_page * self.page_size
+        page = self.filter_matches[start:needed]
+        # There is a next page if we already have more matches, or if more might
+        # still be found further in the file.
+        self.has_next_page = len(self.filter_matches) > needed or (
+            not self.filter_exhausted and len(self.filter_matches) >= needed
+        )
+        header = self.column_headers
+        self._display(header, page, filtered=True)
 
-        # Keep the row indicator and nav buttons in sync with the loaded page
-        self.page_label.config(text=self._page_label_text(row_count))
+    def _ensure_filter_matches(self, needed):
+        """
+        Scan forward (resuming where we left off) until at least `needed` matches
+        are collected or the file is exhausted. Runs on the UI thread with a busy
+        cursor; bounded by how far the user pages, not the whole file up front.
+        """
+        if self.filter_exhausted or len(self.filter_matches) >= needed:
+            return
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            with open(self.file_path, "r", newline="", encoding=self.encoding,
+                      errors="replace") as f:
+                if self.filter_scan_offset is not None:
+                    f.seek(self.filter_scan_offset)
+                    self._byte_pos = self.filter_scan_offset
+                    idx = self.filter_scan_idx
+                    reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
+                else:
+                    reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
+                    if self.has_header:
+                        next(reader)
+                    self.page_offsets.setdefault(0, self._byte_pos)
+                    idx = 0
+
+                header_len = len(self.column_headers)
+                for row in reader:
+                    if any(self.filter_query in cell.lower() for cell in row):
+                        padded = row + [""] * (header_len - len(row))
+                        self.filter_matches.append((idx, padded))
+                        if len(self.filter_matches) >= needed:
+                            self.filter_scan_offset = self._byte_pos
+                            self.filter_scan_idx = idx + 1
+                            return
+                    idx += 1
+                self.filter_exhausted = True
+                self.filter_scan_offset = self._byte_pos
+                self.filter_scan_idx = idx
+        finally:
+            self.root.config(cursor="")
+
+    def _reset_filter_index(self):
+        """Clear the lazily-built filter match index."""
+        self.filter_matches = []
+        self.filter_scan_offset = None
+        self.filter_scan_idx = 0
+        self.filter_exhausted = False
+
+    def _display(self, header, rows, filtered=False):
+        """
+        Render a list of (abs_idx, full_padded_row) into the treeview, including
+        the row-number column, alternating colors, content-fit widths, and the
+        page indicator. Shared by the normal and filtered render paths.
+        """
+        self.column_visibility_button.config(state="normal")
+        self.tree.delete(*self.tree.get_children())
+
+        visible_columns = [
+            i for i in range(len(header)) if i not in self.hidden_columns
+        ]
+        columns = [self.ROWNUM_ID] + visible_columns
+        self.tree["columns"] = columns
+        self.tree.heading(self.ROWNUM_ID, text="#")
+        self.tree.column(self.ROWNUM_ID, anchor="e", stretch=False)
+        for i in visible_columns:
+            self.tree.heading(i, text=str(header[i]))
+            self.tree.column(i, anchor="w")
+
+        self._page_full_rows = []
+        sample_rows = []
+        for position, (abs_idx, full_row) in enumerate(rows):
+            visible_row = [full_row[i] for i in visible_columns]
+            values = [abs_idx + 1] + visible_row
+            tag = "odd" if position % 2 else "even"
+            self.tree.insert("", "end", values=values, tags=(tag,))
+            self._page_full_rows.append(full_row)
+            if len(sample_rows) < 300:
+                sample_rows.append(values)
+
+        self.tree.tag_configure(
+            "even", background=self.odd_row_color, foreground=self.row_text_color
+        )
+        self.tree.tag_configure(
+            "odd", background=self.even_row_color, foreground=self.row_text_color
+        )
+        self._apply_column_widths(columns, header, sample_rows)
+
+        self.page_label.config(text=self._page_label_text(len(rows), filtered=filtered))
         self._update_nav_buttons()
 
     def _apply_column_widths(self, columns, header, sample_rows):
         """
-        Size each column to fit its header and sampled cell content. In fit mode
-        (expand_columns False) columns are capped and stretch to fill the window;
-        in expanded mode they take full content width (horizontal scroll instead).
+        Size each column to fit its header and sampled cell content. Fit mode
+        (expand_columns False) caps width and stretches to fill the window;
+        expanded mode uses full content width (horizontal scroll instead).
         """
         font = tkfont.nametofont("TkDefaultFont")
         pad = 24
         min_w = 50
         cap = 1200 if self.expand_columns else 360
         for pos, colid in enumerate(columns):
-            cell_w = max(
-                (font.measure(str(r[pos])) for r in sample_rows), default=0
-            )
+            cell_w = max((font.measure(str(r[pos])) for r in sample_rows), default=0)
             if colid == self.ROWNUM_ID:
                 content = max(font.measure("#"), cell_w)
                 self.tree.column(
@@ -952,12 +1169,16 @@ class LazyCSVViewerGUI:
             width = min(cap, max(min_w, content + pad))
             self.tree.column(colid, width=width, stretch=not self.expand_columns)
 
-    def _page_label_text(self, row_count):
-        """Build the 'Rows A-B of ~N' indicator for the current page."""
+    def _page_label_text(self, row_count, filtered=False):
+        """Build the page indicator text for the current (filtered) page."""
         if row_count == 0:
-            return "No rows"
+            return "No matching rows" if filtered else "No rows"
         start = self.current_page * self.page_size + 1
         end = self.current_page * self.page_size + row_count
+        if filtered:
+            total = len(self.filter_matches)
+            more = "" if self.filter_exhausted else "+"
+            return f"Matches {start:,}–{end:,} of {total:,}{more}"
         label = f"Rows {start:,}–{end:,}"
         if self.total_rows is not None:
             approx = "~" if self.total_is_estimate else ""
@@ -976,15 +1197,19 @@ class LazyCSVViewerGUI:
     def _reset_view(self):
         """Clear the view back to an empty state after a failed load."""
         self.file_path = None
-        self._count_token += 1  # invalidate any in-flight background count
+        self._count_token += 1
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = ()
         self.column_headers = []
+        self._page_full_rows = []
         self.has_next_page = False
         self.current_page = 0
         self.page_offsets = {}
         self.total_rows = None
         self.total_is_estimate = False
+        self.filter_active = False
+        self.filter_var.set(False)
+        self._reset_filter_index()
         self.page_label.config(text="No file loaded")
         self.column_visibility_button.config(state="disabled")
         self._update_nav_buttons()
@@ -1014,15 +1239,19 @@ class LazyCSVViewerGUI:
             return
         if row < 1:
             row = 1
-        if self.total_rows is not None and not self.total_is_estimate:
+        if (
+            not self.filter_active
+            and self.total_rows is not None
+            and not self.total_is_estimate
+        ):
             row = min(row, max(1, self.total_rows))
         self._go_to_row(row)
 
     def _go_to_row(self, row_1based):
-        """Navigate to the page holding a 1-based data row and select it."""
+        """Navigate to the page holding a 1-based row and select it."""
         self.current_page = (row_1based - 1) // self.page_size
         self._load_page()
-        if not self.file_path:  # load may have reset the view on error
+        if not self.file_path:
             return
         self._select_row_in_view((row_1based - 1) % self.page_size)
 
@@ -1035,9 +1264,31 @@ class LazyCSVViewerGUI:
             self.tree.focus(item)
             self.tree.see(item)
 
-    def find_next(self, event=None):
-        """Find the next row containing the search text, scanning the whole file."""
+    def toggle_filter(self):
+        """Turn the row filter on/off, using the current search text as the query."""
         if not self.file_path:
+            self.filter_var.set(False)
+            return
+        if self.filter_var.get():
+            query = self.search_var.get()
+            if not query:
+                self.filter_var.set(False)
+                self.search_status.config(text="Enter text to filter")
+                return
+            self.filter_active = True
+            self.filter_query = query.lower()
+            self._reset_filter_index()
+            self.current_page = 0
+            self._load_page()
+        else:
+            self.filter_active = False
+            self.filter_query = None
+            self.current_page = 0
+            self._load_page()
+
+    def find_next(self, event=None):
+        """Start a background search for the next row containing the search text."""
+        if not self.file_path or self._searching:
             return
         query = self.search_var.get()
         if not query:
@@ -1047,70 +1298,85 @@ class LazyCSVViewerGUI:
             self._last_match_row = -1
 
         start = self._last_match_row + 1
-        self.root.config(cursor="watch")
-        self.root.update_idletasks()
+        start_page = max(
+            (p for p in self.page_offsets if p * self.page_size <= start), default=0
+        )
+        start_offset = self.page_offsets.get(start_page, 0)
+        start_offset_idx = start_page * self.page_size if start_offset else 0
+
+        self._search_token += 1
+        token = self._search_token
+        self._search_cancel = threading.Event()
+        self._set_searching(True)
+        threading.Thread(
+            target=self._search_worker,
+            args=(
+                self.file_path, self.encoding, self.delimiter, query.lower(),
+                self.has_header, start, start_offset, start_offset_idx,
+                self._search_cancel, token,
+            ),
+            daemon=True,
+        ).start()
+
+    def _search_worker(self, path, encoding, delimiter, query_lower, has_header,
+                       start, start_offset, start_offset_idx, cancel, token):
+        """Run the (cancelable) file-wide scan on a worker thread."""
         try:
-            match = self._scan_for_match(query.lower(), start)
-            wrapped = False
-            if match is None and start > 0:
-                match = self._scan_for_match(query.lower(), 0, stop=start)
-                wrapped = True
-        finally:
-            self.root.config(cursor="")
-
-        if match is None:
-            self.search_status.config(text="Not found")
-            self._last_match_row = -1
-            return
-        self._last_match_row = match
-        suffix = " (wrapped)" if wrapped else ""
-        self.search_status.config(text=f"Row {match + 1:,}{suffix}")
-        self._go_to_row(match + 1)
-
-    def _scan_for_match(self, query_lower, start_row, stop=None):
-        """
-        Return the absolute 0-based data-row index of the next row whose cells
-        contain query_lower, scanning from start_row (exclusive upper bound
-        `stop`, used for wrap-around). Caches page offsets seen along the way so
-        the subsequent navigation is an O(1) seek.
-        """
-        with open(self.file_path, "r", newline="", encoding=self.encoding,
-                  errors="replace") as f:
-            # Start from the nearest cached page boundary at or before start_row
-            start_page = max(
-                (p for p in self.page_offsets if p * self.page_size <= start_row),
-                default=0,
+            result = scan_for_match(
+                path, encoding, delimiter, query_lower, has_header, start,
+                None, start_offset, start_offset_idx, cancel,
             )
-            if start_page in self.page_offsets:
-                f.seek(self.page_offsets[start_page])
-                self._byte_pos = self.page_offsets[start_page]
-                reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
-                idx = start_page * self.page_size
-            else:
-                reader = csv.reader(self._row_iter(f), delimiter=self.delimiter)
-                try:
-                    next(reader)  # header
-                except StopIteration:
-                    return None
-                self.page_offsets.setdefault(0, self._byte_pos)
-                idx = 0
+            wrapped = False
+            if result is None and start > 0:
+                result = scan_for_match(
+                    path, encoding, delimiter, query_lower, has_header, 0, start,
+                    0, 0, cancel,
+                )
+                wrapped = True
+            self._search_queue.put((token, result, wrapped))
+        except (OSError, csv.Error):
+            self._search_queue.put((token, None, False))
 
-            for row in reader:
-                if idx >= start_row and (stop is None or idx < stop):
-                    if any(query_lower in cell.lower() for cell in row):
-                        return idx
-                if (idx + 1) % self.page_size == 0:
-                    self.page_offsets.setdefault(
-                        (idx + 1) // self.page_size, self._byte_pos
-                    )
-                idx += 1
-                if stop is not None and idx >= stop:
-                    break
-        return None
+    def _poll_search_queue(self):
+        """Apply a finished search result (for the current search), then reschedule."""
+        try:
+            while True:
+                token, result, wrapped = self._search_queue.get_nowait()
+                if token != self._search_token:
+                    continue
+                self._set_searching(False)
+                if result == "cancelled":
+                    self.search_status.config(text="Cancelled")
+                elif result is None:
+                    self.search_status.config(text="Not found")
+                    self._last_match_row = -1
+                else:
+                    self._last_match_row = result
+                    suffix = " (wrapped)" if wrapped else ""
+                    self.search_status.config(text=f"Row {result + 1:,}{suffix}")
+                    self._go_to_row(result + 1)
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_search_queue)
+
+    def cancel_search(self):
+        """Request cancellation of the in-flight search."""
+        if self._searching:
+            self._search_cancel.set()
+
+    def _set_searching(self, on):
+        """Reflect the searching state in the buttons, status, and cursor."""
+        self._searching = on
+        self.find_button.config(state="disabled" if on else "normal")
+        self.cancel_button.config(state="normal" if on else "disabled")
+        if on:
+            self.search_status.config(text="Searching…")
+            self.root.config(cursor="watch")
+        else:
+            self.root.config(cursor="")
 
 
 if __name__ == "__main__":
-    # Create the main window and start the application
     root = tk.Tk()
     app = LazyCSVViewerGUI(root)
     root.mainloop()

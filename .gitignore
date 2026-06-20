@@ -1,4 +1,14 @@
 build
 dist
 *.spec
-*test*
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+
+# Generated app icon (produced by scripts/make_icon.py during build)
+assets/
+
+# Test fixtures (generated CSV data) — but keep the tests/ source tracked
+test_data/
+*test*.csv

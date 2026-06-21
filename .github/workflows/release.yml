@@ -1,0 +1,161 @@
+name: Release
+
+# Cut a release by pushing a version tag, e.g.:  git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release
+
+jobs:
+  # ---------------------------------------------------------------- macOS app
+  build-mac:
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Resolve version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Verify tkinter is available
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Build .app (unsigned)
+        run: PYTHON=python ./build.sh
+
+      - name: Package (zip the .app, preserving the bundle)
+        id: package
+        run: |
+          ASSET="Lazy-CSV-Viewer-${{ steps.meta.outputs.version }}.zip"
+          ditto -c -k --keepParent "dist/Lazy CSV Viewer.app" "$ASSET"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "$ASSET" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: ${{ steps.package.outputs.asset }}
+
+  # -------------------------------------------------------------- Windows app
+  build-win:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash # use bash on Windows so the syntax matches the other jobs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Resolve version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        run: python -m pip install --upgrade pip pyinstaller pillow
+
+      - name: Generate icon (.ico)
+        run: |
+          python scripts/make_icon.py
+          python -c "from PIL import Image; Image.open('assets/icon_1024.png').save('icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
+      - name: Build .exe (unsigned, one file)
+        run: python -m PyInstaller --noconfirm --windowed --onefile --name "Lazy CSV Viewer" --icon icon.ico main.py
+
+      - name: Package (zip the .exe)
+        id: package
+        run: |
+          ASSET="Lazy-CSV-Viewer-${{ steps.meta.outputs.version }}-windows.zip"
+          cd dist
+          7z a "../$ASSET" "Lazy CSV Viewer.exe"
+          cd ..
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win
+          path: ${{ steps.package.outputs.asset }}
+
+  # ----------------------------------------------------- GitHub release (both)
+  release:
+    needs: [build-mac, build-win]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4 # for CHANGELOG.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts # -> artifacts/mac/*.zip, artifacts/win/*.zip
+
+      - name: Resolve version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Hybrid notes: use the hand-written CHANGELOG section for this version if
+      # present, otherwise fall back to GitHub's auto-generated notes.
+      - name: Release notes from CHANGELOG (if any)
+        id: notes
+        run: |
+          awk -v v="${{ steps.meta.outputs.version }}" '
+            $0 ~ ("^## \\[" v "\\]") {f=1; next}
+            f && /^## \[/ {exit}
+            f {print}
+          ' CHANGELOG.md 2>/dev/null | awk 'NF{p=1} p' > RELEASE_NOTES.md || true
+          if [ -s RELEASE_NOTES.md ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+            echo "----- using CHANGELOG notes -----"; cat RELEASE_NOTES.md
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "no CHANGELOG section for ${{ steps.meta.outputs.version }} -> auto-generating"
+          fi
+
+      - name: Create GitHub Release (curated notes)
+        if: steps.notes.outputs.have == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+
+      - name: Create GitHub Release (auto-generated notes)
+        if: steps.notes.outputs.have != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------- Homebrew cask (macOS only)
+  # Reuses the tap's reusable workflow; runs after the release so the asset URL
+  # is live. Needs a TAP_DEPLOY_KEY secret on this repo (write access to the tap).
+  cask:
+    needs: [build-mac, release]
+    uses: Rudra370/homebrew-tap/.github/workflows/update-cask.yml@main
+    with:
+      cask: lazy-csv-viewer
+      version: ${{ needs.build-mac.outputs.version }}
+      sha256: ${{ needs.build-mac.outputs.sha256 }}
+      url: "https://github.com/${{ github.repository }}/releases/download/v${{ needs.build-mac.outputs.version }}/Lazy-CSV-Viewer-${{ needs.build-mac.outputs.version }}.zip"
+      name: Lazy CSV Viewer
+      desc: Lazy-loading viewer for very large CSV files
+      homepage: "https://github.com/${{ github.repository }}"
+      app: "Lazy CSV Viewer.app"
+    secrets:
+      deploy_key: ${{ secrets.TAP_DEPLOY_KEY }}

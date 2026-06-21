@@ -22,7 +22,21 @@ A lightweight, efficient CSV viewer application that loads and displays CSV file
 
 ## Installation
 
-### Option 1: Run from Source
+### Option 1: Homebrew (macOS)
+
+```
+brew install --cask rudra370/tap/lazy-csv-viewer
+```
+
+The app is unsigned, so the first time you launch it, right-click the app and
+choose **Open** to get past Gatekeeper.
+
+### Option 2: Download a prebuilt app
+
+Grab the latest macOS `.app` or Windows `.exe` from the
+[Releases](https://github.com/Rudra370/lazy_csv_viewer/releases) page and unzip it.
+
+### Option 3: Run from source
 
 1. Ensure you have Python 3.6+ installed
 2. Clone this repository:
@@ -35,7 +49,7 @@ A lightweight, efficient CSV viewer application that loads and displays CSV file
    python main.py
    ```
 
-### Option 2: Standalone macOS App
+### Option 4: Build a standalone macOS app
 
 Build a double-clickable `.app` bundle (generates an icon and runs PyInstaller).
 On Homebrew Python the system `pip` is locked down, so install tools into a

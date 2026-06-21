@@ -25,17 +25,12 @@ A lightweight, efficient CSV viewer application that loads and displays CSV file
 ### Option 1: Homebrew (macOS)
 
 ```
-brew install --cask rudra370/tap/lazy-csv-viewer
+brew install --cask rudra370/tap/lazy-csv-viewer && xattr -dr com.apple.quarantine "/Applications/Lazy CSV Viewer.app"
 ```
 
-The app is unsigned, so macOS quarantines it on install. Clear the quarantine
-flag once so it opens normally:
-
-```
-xattr -dr com.apple.quarantine "/Applications/Lazy CSV Viewer.app"
-```
-
-(Or open it once via System Settings → Privacy & Security → **Open Anyway**.)
+The app is unsigned, so the command also clears the Gatekeeper quarantine — just
+copy-paste the whole line. (Or, instead of `xattr`, open it once via System
+Settings → Privacy & Security → **Open Anyway**.)
 
 ### Option 2: Download a prebuilt app
 

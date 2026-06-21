@@ -17,9 +17,9 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       sha256: ${{ steps.package.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -44,7 +44,7 @@ jobs:
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
           echo "sha256=$(shasum -a 256 "$ASSET" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mac
           path: ${{ steps.package.outputs.asset }}
@@ -56,9 +56,9 @@ jobs:
       run:
         shell: bash # use bash on Windows so the syntax matches the other jobs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -86,7 +86,7 @@ jobs:
           cd ..
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: win
           path: ${{ steps.package.outputs.asset }}
@@ -98,9 +98,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4 # for CHANGELOG.md
+      - uses: actions/checkout@v5 # for CHANGELOG.md
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts # -> artifacts/mac/*.zip, artifacts/win/*.zip
 
@@ -128,7 +128,7 @@ jobs:
 
       - name: Create GitHub Release (curated notes)
         if: steps.notes.outputs.have == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*.zip
           body_path: RELEASE_NOTES.md
@@ -136,7 +136,7 @@ jobs:
 
       - name: Create GitHub Release (auto-generated notes)
         if: steps.notes.outputs.have != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*.zip
           generate_release_notes: true

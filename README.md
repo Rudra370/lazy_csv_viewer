@@ -9,6 +9,8 @@ page you're viewing, so multi-gigabyte files open instantly — with search, fil
 jump-to-row, and a full-record detail view on top. Built with Python and Tkinter
 for macOS and Windows.
 
+![Lazy CSV Viewer — a 2,000,000-row file open in dark mode](docs/screenshot.png)
+
 ## Features
 
 - **Page-by-page loading**: Open huge CSV files in a fraction of a second — only the current page is read, and Next/Previous seek directly to each page

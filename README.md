@@ -1,6 +1,13 @@
 # Lazy CSV Viewer
 
-A lightweight, efficient CSV viewer application that loads and displays CSV files page by page. Built with Python and Tkinter.
+![Release](https://img.shields.io/github/v/release/Rudra370/lazy_csv_viewer)
+![License](https://img.shields.io/github/license/Rudra370/lazy_csv_viewer)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-blue)
+
+Open **huge** CSV files in a fraction of a second. Lazy CSV Viewer reads only the
+page you're viewing, so multi-gigabyte files open instantly — with search, filter,
+jump-to-row, and a full-record detail view on top. Built with Python and Tkinter
+for macOS and Windows.
 
 ## Features
 
@@ -17,7 +24,7 @@ A lightweight, efficient CSV viewer application that loads and displays CSV file
 - **Column management**: Show/hide columns, auto-fit to content, or expand to full width; a left row-number column
 - **Copy**: Right-click to copy a cell, row, or column
 - **Recent files & persistence**: Remembers window size, page size, delimiter, and recently opened files
-- **Dark mode**: Matches the macOS appearance and re-themes live when you toggle it
+- **Dark mode (macOS)**: Matches the system appearance and re-themes live when you toggle it; Windows uses the light theme
 - **Improved readability**: Alternating row colors for easier reading
 
 ## Installation
@@ -45,7 +52,7 @@ xattr -dr com.apple.quarantine "Lazy CSV Viewer.app"
 
 ### Option 3: Run from source
 
-1. Ensure you have Python 3.6+ installed
+1. Ensure you have Python 3.7+ installed
 2. Clone this repository:
    ```
    git clone https://github.com/Rudra370/lazy_csv_viewer
@@ -53,7 +60,7 @@ xattr -dr com.apple.quarantine "Lazy CSV Viewer.app"
    ```
 3. Run the application:
    ```
-   python main.py
+   python3 main.py
    ```
 
 ### Option 4: Build a standalone macOS app
@@ -75,14 +82,18 @@ run it directly (`python -m PyInstaller --windowed main.py`).
 
 ## Usage
 
-1. Launch the application
-2. Click "Open CSV File" and select your CSV file
-3. Use the delimiter dropdown to select the appropriate delimiter for your file
-4. Navigate through the data using the "Previous Page" and "Next Page" buttons
-5. Customize your view:
-   - Adjust page size with the "Page Size" field and "Apply" button
-   - Toggle column width with the "Expand Columns" / "Collapse Columns" button
-   - Show/hide specific columns with the "Show/Hide Columns" button
+1. Click **Open CSV File** (or `Cmd/Ctrl+O`) and pick a file — the delimiter and
+   encoding are detected automatically.
+2. Page through with **Previous / Next** (or `Cmd/Ctrl+←/→`); the indicator shows
+   `Rows A–B of N`.
+3. **Search** any text with Find Next (`Cmd/Ctrl+F`), or tick **Filter** to show
+   only matching rows. **Go to row** jumps straight to a row number.
+4. **Double-click a row** to open its full record — every field, untruncated,
+   including hidden columns.
+5. **Right-click** a cell to copy the cell, row, or column.
+6. Tune the view: page size, **Expand / Collapse Columns**, **Show/Hide Columns**,
+   and **No header row** for headerless files. Window size, page size, delimiter,
+   and recent files are remembered between launches.
 
 ### Keyboard Shortcuts
 
@@ -109,8 +120,10 @@ python -m pytest
 
 ## Requirements
 
-- Python 3.6 or higher
-- Tkinter (usually included with Python; on Homebrew Python install `python-tk`)
+Only needed to run from source or build — the Homebrew and prebuilt apps bundle everything:
+
+- Python 3.7+
+- Tkinter (bundled with most Python installs; on Homebrew Python: `brew install python-tk`)
 
 ## License
 
